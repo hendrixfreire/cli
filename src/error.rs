@@ -148,11 +148,54 @@ impl GwsError {
     }
 }
 
+/// Returns true when stderr is connected to an interactive terminal,
+/// meaning ANSI color codes will be visible to the user.
+fn stderr_supports_color() -> bool {
+    use std::io::IsTerminal;
+    std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+/// Wrap `text` in ANSI bold + the given color code, resetting afterwards.
+/// Returns the plain text unchanged when stderr is not a TTY.
+fn colorize(text: &str, ansi_color: &str) -> String {
+    if stderr_supports_color() {
+        format!("\x1b[1;{ansi_color}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+/// Strip terminal control characters from `text` to prevent escape-sequence
+/// injection when printing untrusted content (API responses, user input) to
+/// stderr.  Preserves newlines and tabs for readability.
+pub(crate) fn sanitize_for_terminal(text: &str) -> String {
+    text.chars()
+        .filter(|&c| {
+            if c == '\n' || c == '\t' {
+                return true;
+            }
+            !c.is_control()
+        })
+        .collect()
+}
+
+/// Format a colored error label for the given error variant.
+fn error_label(err: &GwsError) -> String {
+    match err {
+        GwsError::Api { .. } => colorize("error[api]:", "31"), // red
+        GwsError::Auth(_) => colorize("error[auth]:", "31"),   // red
+        GwsError::Validation(_) => colorize("error[validation]:", "33"), // yellow
+        GwsError::Discovery(_) => colorize("error[discovery]:", "31"), // red
+        GwsError::Other(_) => colorize("error:", "31"),        // red
+    }
+}
+
 /// Formats any error as a JSON object and prints to stdout.
 ///
-/// For `accessNotConfigured` errors (HTTP 403, reason `accessNotConfigured`),
-/// additional human-readable guidance is printed to stderr explaining how to
-/// enable the API in GCP. The JSON output on stdout is unchanged (machine-readable).
+/// A human-readable colored label is printed to stderr when connected to a
+/// TTY. For `accessNotConfigured` errors (HTTP 403, reason
+/// `accessNotConfigured`), additional guidance is printed to stderr.
+/// The JSON output on stdout is unchanged (machine-readable).
 pub fn print_error_json(err: &GwsError) {
     let json = err.to_json();
     println!(
@@ -160,22 +203,34 @@ pub fn print_error_json(err: &GwsError) {
         serde_json::to_string_pretty(&json).unwrap_or_default()
     );
 
-    // Print actionable guidance to stderr for accessNotConfigured errors
+    // Print a colored summary to stderr. For accessNotConfigured errors,
+    // print specialized guidance instead of the generic message to avoid
+    // redundant output (the full API error already appears in the JSON).
     if let GwsError::Api {
         reason, enable_url, ..
     } = err
     {
         if reason == "accessNotConfigured" {
             eprintln!();
-            eprintln!("💡 API not enabled for your GCP project.");
+            let hint = colorize("hint:", "36"); // cyan
+            eprintln!(
+                "{} {hint} API not enabled for your GCP project.",
+                error_label(err)
+            );
             if let Some(url) = enable_url {
-                eprintln!("   Enable it at: {url}");
+                eprintln!("      Enable it at: {url}");
             } else {
-                eprintln!("   Visit the GCP Console → APIs & Services → Library to enable the required API.");
+                eprintln!("      Visit the GCP Console → APIs & Services → Library to enable the required API.");
             }
-            eprintln!("   After enabling, wait a few seconds and retry your command.");
+            eprintln!("      After enabling, wait a few seconds and retry your command.");
+            return;
         }
     }
+    eprintln!(
+        "{} {}",
+        error_label(err),
+        sanitize_for_terminal(&err.to_string())
+    );
 }
 
 #[cfg(test)]
@@ -326,5 +381,59 @@ mod tests {
         assert_eq!(json["error"]["reason"], "accessNotConfigured");
         // enable_url key should not appear in JSON when None
         assert!(json["error"]["enable_url"].is_null());
+    }
+
+    // --- colored output tests ---
+
+    #[test]
+    #[serial_test::serial]
+    fn test_colorize_respects_no_color_env() {
+        // NO_COLOR is the de-facto standard for disabling colors.
+        // When set, colorize() should return the plain text.
+        std::env::set_var("NO_COLOR", "1");
+        let result = colorize("hello", "31");
+        std::env::remove_var("NO_COLOR");
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn test_error_label_contains_variant_name() {
+        let api_err = GwsError::Api {
+            code: 400,
+            message: "bad".to_string(),
+            reason: "r".to_string(),
+            enable_url: None,
+        };
+        let label = error_label(&api_err);
+        assert!(label.contains("error[api]:"));
+
+        let auth_err = GwsError::Auth("fail".to_string());
+        assert!(error_label(&auth_err).contains("error[auth]:"));
+
+        let val_err = GwsError::Validation("bad input".to_string());
+        assert!(error_label(&val_err).contains("error[validation]:"));
+
+        let disc_err = GwsError::Discovery("missing".to_string());
+        assert!(error_label(&disc_err).contains("error[discovery]:"));
+
+        let other_err = GwsError::Other(anyhow::anyhow!("oops"));
+        assert!(error_label(&other_err).contains("error:"));
+    }
+
+    #[test]
+    fn test_sanitize_for_terminal_strips_control_chars() {
+        // ANSI escape sequence should be stripped
+        let input = "normal \x1b[31mred text\x1b[0m end";
+        let sanitized = sanitize_for_terminal(input);
+        assert_eq!(sanitized, "normal [31mred text[0m end");
+        assert!(!sanitized.contains('\x1b'));
+
+        // Newlines and tabs preserved
+        let input2 = "line1\nline2\ttab";
+        assert_eq!(sanitize_for_terminal(input2), "line1\nline2\ttab");
+
+        // Other control characters stripped
+        let input3 = "hello\x07bell\x08backspace";
+        assert_eq!(sanitize_for_terminal(input3), "hellobellbackspace");
     }
 }
